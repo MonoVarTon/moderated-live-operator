@@ -4,6 +4,7 @@ import { createServer } from "http";
 import { createExpressMiddleware } from "@trpc/server/adapters/express";
 import { registerOAuthRoutes } from "./oauth";
 import { publicPlatformScript } from "./publicConfig";
+import { installBodyParsers } from "./bodyParser";
 import { appRouter } from "../routers";
 import { createContext } from "./context";
 import { serveStatic, setupVite } from "./vite";
@@ -11,12 +12,13 @@ import { serveStatic, setupVite } from "./vite";
 async function startServer() {
   const app = express();
   const server = createServer(app);
-  // Configure body parser with larger size limit for file uploads
-  app.use(express.json({ limit: "50mb" }));
-  app.use(express.urlencoded({ limit: "50mb", extended: true }));
+  installBodyParsers(app);
   app.get("/api/health", (_req, res) => res.json({ status: "ok" }));
   app.get("/api/platform/config.js", (_req, res) => {
-    res.set("Cache-Control", "no-store").type("application/javascript").send(publicPlatformScript());
+    res
+      .set("Cache-Control", "no-store")
+      .type("application/javascript")
+      .send(publicPlatformScript());
   });
   registerOAuthRoutes(app);
   // tRPC API
@@ -35,9 +37,21 @@ async function startServer() {
   }
 
   const port = Number(process.env.PORT || "3000");
-  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("Invalid PORT");
-  server.on("error", error => { console.error("Server failed:", error.message); process.exit(1); });
-  server.listen(port, "0.0.0.0", () => console.log(`Server listening on port ${port}`));
+  if (!Number.isInteger(port) || port < 1 || port > 65535)
+    throw new Error("Invalid PORT");
+  const host =
+    process.env.HOST ||
+    (process.env.NODE_ENV === "development" ? "127.0.0.1" : "0.0.0.0");
+  server.on("error", error => {
+    console.error("Server failed:", error.message);
+    process.exit(1);
+  });
+  server.listen(port, host, () =>
+    console.log(`Server listening on ${host}:${port}`)
+  );
 }
 
-startServer().catch(error => { console.error(error); process.exit(1); });
+startServer().catch(error => {
+  console.error(error);
+  process.exit(1);
+});

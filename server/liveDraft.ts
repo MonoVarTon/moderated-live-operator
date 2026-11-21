@@ -1,18 +1,17 @@
-import {
-  invokeLLM,
-  type InvokeParams,
-  type InvokeResult,
-} from "./_core/llm";
+import { invokeLLM, type InvokeParams, type InvokeResult } from "./_core/llm";
 import { getLiveFixture, type LiveFixtureId } from "../shared/liveFixtures";
 
-export const LIVE_DRAFT_MODEL = process.env.LIVE_DRAFT_MODEL ?? "configured-model";
+export const LIVE_DRAFT_MODEL =
+  process.env.LIVE_DRAFT_MODEL ?? "configured-model";
 export const LIVE_DRAFT_TIMEOUT_MS = 12_000;
 export const LIVE_DRAFT_COOLDOWN_MS = 5_000;
+export const LIVE_DRAFT_MAX_CONCURRENT = 8;
 export const LIVE_DRAFT_MAX_CHARS = 220;
 
 export type LiveDraftErrorCode =
   | "UNSUPPORTED_FIXTURE"
   | "RATE_LIMITED"
+  | "CANCELLED"
   | "MODEL_TIMEOUT"
   | "MODEL_UNAVAILABLE"
   | "MODEL_EMPTY"
@@ -39,9 +38,23 @@ const SYSTEM_PROMPT = [
   "Return plain text only, with no links, contact details, diagnoses, promises, or assumptions about the viewer.",
 ].join(" ");
 
+const OFFLINE_DEMO_DRAFTS: Record<LiveFixtureId, string> = {
+  T01: "Это демонстрационная сцена с синтетическими данными; реальный эфир не подключён.",
+  T02: "В тестовых данных замысел автора не указан, поэтому я не буду его угадывать.",
+  T03: "В этой фикстуре подтверждён только статус демо-сцены; других фактов нет.",
+};
+
+export type LiveDraftMode = "offline-demo" | "provider";
+
+export function getLiveDraftMode(): LiveDraftMode {
+  return process.env.LIVE_DRAFT_MODE === "provider"
+    ? "provider"
+    : "offline-demo";
+}
+
 const containsSensitivePattern = (text: string) =>
   /(?:https?:\/\/|www\.)|[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}|(?:\+?\d[\d\s().-]{8,}\d)/iu.test(
-    text,
+    text
   );
 
 function validateDraft(content: unknown): string | null {
@@ -57,22 +70,61 @@ export function createDraftService(options: DraftServiceOptions = {}) {
   const now = options.now ?? Date.now;
   const timeoutMs = options.timeoutMs ?? LIVE_DRAFT_TIMEOUT_MS;
   const cooldownMs = options.cooldownMs ?? LIVE_DRAFT_COOLDOWN_MS;
-  let nextRequestAt = 0;
+  const nextRequestAt = new Map<string, number>();
+  const activeRequests = new Set<AbortController>();
+  const pendingRequests = new Map<string, () => void>();
 
   return {
-    async createDraft(fixtureId: LiveFixtureId | string): Promise<LiveDraftResult> {
+    async createDraft(
+      fixtureId: LiveFixtureId | string,
+      requesterKey = "global",
+      requestId?: string
+    ): Promise<LiveDraftResult> {
       const fixture = getLiveFixture(fixtureId);
       if (!fixture || !fixture.aiEligible) {
         return { ok: false, code: "UNSUPPORTED_FIXTURE" };
       }
 
       const startedAt = now();
-      if (startedAt < nextRequestAt) {
+      for (const [key, allowedAt] of nextRequestAt) {
+        if (allowedAt <= startedAt) nextRequestAt.delete(key);
+      }
+      const allowedAt = nextRequestAt.get(requesterKey) ?? 0;
+      if (
+        startedAt < allowedAt ||
+        (!nextRequestAt.has(requesterKey) && nextRequestAt.size >= 1_024)
+      ) {
         return { ok: false, code: "RATE_LIMITED" };
       }
-      nextRequestAt = startedAt + cooldownMs;
+      nextRequestAt.set(requesterKey, startedAt + cooldownMs);
+
+      if (!options.invoke && getLiveDraftMode() === "offline-demo") {
+        return {
+          ok: true,
+          text: OFFLINE_DEMO_DRAFTS[fixture.id],
+          model: "offline-demo",
+        };
+      }
+
+      const pendingKey = requestId
+        ? `${requesterKey}\u0000${requestId}`
+        : undefined;
+      if (
+        activeRequests.size >= LIVE_DRAFT_MAX_CONCURRENT ||
+        (pendingKey && pendingRequests.has(pendingKey))
+      ) {
+        return { ok: false, code: "RATE_LIMITED" };
+      }
 
       const controller = new AbortController();
+      let cancelledByOperator = false;
+      activeRequests.add(controller);
+      if (pendingKey) {
+        pendingRequests.set(pendingKey, () => {
+          cancelledByOperator = true;
+          controller.abort();
+        });
+      }
       const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
       try {
@@ -98,20 +150,47 @@ export function createDraftService(options: DraftServiceOptions = {}) {
           };
         }
 
-        return { ok: true, text, model: LIVE_DRAFT_MODEL };
+        return { ok: true, text, model: response.model || LIVE_DRAFT_MODEL };
       } catch {
         return {
           ok: false,
-          code: controller.signal.aborted ? "MODEL_TIMEOUT" : "MODEL_UNAVAILABLE",
+          code: cancelledByOperator
+            ? "CANCELLED"
+            : controller.signal.aborted
+              ? "MODEL_TIMEOUT"
+              : "MODEL_UNAVAILABLE",
         };
       } finally {
         clearTimeout(timeout);
+        activeRequests.delete(controller);
+        if (pendingKey) pendingRequests.delete(pendingKey);
       }
+    },
+    cancelDraft(requesterKey: string, requestId: string): boolean {
+      const cancel = pendingRequests.get(`${requesterKey}\u0000${requestId}`);
+      if (!cancel) return false;
+      cancel();
+      return true;
     },
   };
 }
 
 const liveDraftService = createDraftService();
+
+export function createLiveDraftForClient(
+  fixtureId: LiveFixtureId | string,
+  requesterKey: string,
+  requestId?: string
+) {
+  return liveDraftService.createDraft(fixtureId, requesterKey, requestId);
+}
+
+export function cancelLiveDraftForClient(
+  requesterKey: string,
+  requestId: string
+): boolean {
+  return liveDraftService.cancelDraft(requesterKey, requestId);
+}
 
 export function createLiveDraft(fixtureId: LiveFixtureId | string) {
   return liveDraftService.createDraft(fixtureId);

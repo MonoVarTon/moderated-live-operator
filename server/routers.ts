@@ -1,12 +1,38 @@
 import { COOKIE_NAME } from "@shared/const";
+import { TRPCError } from "@trpc/server";
 import { getSessionCookieOptions } from "./_core/cookies";
 import { systemRouter } from "./_core/systemRouter";
 import { publicProcedure, router } from "./_core/trpc";
 import { z } from "zod";
-import { createLiveDraft } from "./liveDraft";
+import {
+  cancelLiveDraftForClient,
+  createLiveDraftForClient,
+  getLiveDraftMode,
+} from "./liveDraft";
+
+const liveDraftOperatorProcedure = publicProcedure.use(({ ctx, next }) => {
+  const isAdmin = ctx.user?.role === "admin";
+  const remoteAddress = (ctx.req.socket.remoteAddress ?? "")
+    .toLowerCase()
+    .replace(/^::ffff:/u, "");
+  const isLoopback =
+    remoteAddress === "::1" || remoteAddress.startsWith("127.");
+  const isLocalDemo =
+    process.env.NODE_ENV === "development" &&
+    getLiveDraftMode() === "offline-demo" &&
+    isLoopback;
+
+  if (!isAdmin && !isLocalDemo) {
+    throw new TRPCError({
+      code: "UNAUTHORIZED",
+      message: "An authenticated operator is required for draft generation.",
+    });
+  }
+  return next();
+});
 
 export const appRouter = router({
-    // if you need to use socket.io, read and register route in server/_core/index.ts, all api should start with '/api/' so that the gateway can route correctly
+  // if you need to use socket.io, read and register route in server/_core/index.ts, all api should start with '/api/' so that the gateway can route correctly
   system: systemRouter,
   auth: router({
     me: publicProcedure.query(opts => opts.ctx.user),
@@ -20,9 +46,42 @@ export const appRouter = router({
   }),
 
   live: router({
-    draft: publicProcedure
-      .input(z.object({ fixtureId: z.enum(["T01", "T02", "T03"]) }).strict())
-      .mutation(({ input }) => createLiveDraft(input.fixtureId)),
+    mode: publicProcedure.query(() => getLiveDraftMode()),
+    draft: liveDraftOperatorProcedure
+      .input(
+        z
+          .object({
+            fixtureId: z.enum(["T01", "T02", "T03"]),
+            requestId: z.string().uuid(),
+          })
+          .strict()
+      )
+      .mutation(({ ctx, input }) => {
+        const remoteAddress = (ctx.req.socket.remoteAddress ?? "")
+          .toLowerCase()
+          .replace(/^::ffff:/u, "");
+        const requesterKey = ctx.user
+          ? `user:${ctx.user.openId}`
+          : `ip:${remoteAddress || "unknown"}`;
+        return createLiveDraftForClient(
+          input.fixtureId,
+          requesterKey,
+          input.requestId
+        );
+      }),
+    cancelDraft: liveDraftOperatorProcedure
+      .input(z.object({ requestId: z.string().uuid() }).strict())
+      .mutation(({ ctx, input }) => {
+        const remoteAddress = (ctx.req.socket.remoteAddress ?? "")
+          .toLowerCase()
+          .replace(/^::ffff:/u, "");
+        const requesterKey = ctx.user
+          ? `user:${ctx.user.openId}`
+          : `ip:${remoteAddress || "unknown"}`;
+        return {
+          cancelled: cancelLiveDraftForClient(requesterKey, input.requestId),
+        };
+      }),
   }),
 
   // TODO: add feature routers here, e.g.

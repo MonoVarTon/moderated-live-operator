@@ -3,6 +3,8 @@ import type { InvokeParams, InvokeResult } from "./_core/llm";
 import { invokeLLM } from "./_core/llm";
 import {
   createDraftService,
+  createLiveDraftForClient,
+  getLiveDraftMode,
   LIVE_DRAFT_MODEL,
 } from "./liveDraft";
 import { LIVE_FIXTURES } from "../shared/liveFixtures";
@@ -31,7 +33,7 @@ afterEach(() => {
 describe("safe LIVE draft service", () => {
   it("sends only the selected, pre-approved T01 fixture with the fixed model", async () => {
     const invoke = vi.fn(async (_params: InvokeParams) =>
-      completion("Эта демо-сцена имеет условную метку «Demo»."),
+      completion("Эта демо-сцена имеет условную метку «Demo».")
     );
     const service = createDraftService({ invoke });
 
@@ -59,7 +61,7 @@ describe("safe LIVE draft service", () => {
     const service = createDraftService({ invoke });
 
     const result = await service.createDraft(
-      "T08" as (typeof LIVE_FIXTURES)[number]["id"],
+      "T08" as (typeof LIVE_FIXTURES)[number]["id"]
     );
 
     expect(result).toEqual({ ok: false, code: "UNSUPPORTED_FIXTURE" });
@@ -114,9 +116,9 @@ describe("safe LIVE draft service", () => {
           params.signal?.addEventListener(
             "abort",
             () => reject(new Error("aborted")),
-            { once: true },
+            { once: true }
           );
-        }),
+        })
     );
     const service = createDraftService({ invoke, timeoutMs: 10 });
 
@@ -150,6 +152,104 @@ describe("safe LIVE draft service", () => {
     expect(invoke).toHaveBeenCalledTimes(2);
   });
 
+  it("applies cooldown per requester instead of blocking other operators", async () => {
+    let clock = 1_000;
+    const invoke = vi.fn(async () => completion("Тестовый ответ."));
+    const service = createDraftService({
+      invoke,
+      now: () => clock,
+      cooldownMs: 5_000,
+    });
+
+    await expect(
+      service.createDraft("T01", "operator-a")
+    ).resolves.toMatchObject({ ok: true });
+    await expect(
+      service.createDraft("T02", "operator-b")
+    ).resolves.toMatchObject({ ok: true });
+    await expect(service.createDraft("T03", "operator-a")).resolves.toEqual({
+      ok: false,
+      code: "RATE_LIMITED",
+    });
+    clock += 5_001;
+    await expect(
+      service.createDraft("T03", "operator-a")
+    ).resolves.toMatchObject({ ok: true });
+    expect(invoke).toHaveBeenCalledTimes(3);
+  });
+
+  it("cancels only the matching in-flight request for its requester", async () => {
+    let observedSignal: AbortSignal | undefined;
+    const invoke = vi.fn(
+      (params: InvokeParams) =>
+        new Promise<InvokeResult>((_resolve, reject) => {
+          observedSignal = params.signal;
+          params.signal?.addEventListener(
+            "abort",
+            () => reject(new Error("aborted by operator")),
+            { once: true }
+          );
+        })
+    );
+    const service = createDraftService({ invoke, timeoutMs: 60_000 });
+    const pending = service.createDraft("T01", "operator-a", "request-a");
+
+    expect(service.cancelDraft("operator-b", "request-a")).toBe(false);
+    expect(service.cancelDraft("operator-a", "request-a")).toBe(true);
+    await expect(pending).resolves.toEqual({ ok: false, code: "CANCELLED" });
+    expect(observedSignal?.aborted).toBe(true);
+    expect(service.cancelDraft("operator-a", "request-a")).toBe(false);
+  });
+
+  it("caps concurrent provider invocations", async () => {
+    const invoke = vi.fn(
+      (params: InvokeParams) =>
+        new Promise<InvokeResult>((_resolve, reject) => {
+          params.signal?.addEventListener(
+            "abort",
+            () => reject(new Error("aborted")),
+            { once: true }
+          );
+        })
+    );
+    const service = createDraftService({ invoke, timeoutMs: 60_000 });
+    const pending = Array.from({ length: 8 }, (_, index) =>
+      service.createDraft("T01", `operator-${index}`, `request-${index}`)
+    );
+
+    await expect(
+      service.createDraft("T01", "operator-overflow", "request-overflow")
+    ).resolves.toEqual({ ok: false, code: "RATE_LIMITED" });
+    expect(invoke).toHaveBeenCalledTimes(8);
+
+    for (let index = 0; index < 8; index += 1) {
+      expect(service.cancelDraft(`operator-${index}`, `request-${index}`)).toBe(
+        true
+      );
+    }
+    await expect(Promise.all(pending)).resolves.toHaveLength(8);
+  });
+
+  it("returns fixed offline drafts without calling fetch or a model provider", async () => {
+    vi.stubEnv("LIVE_DRAFT_MODE", "offline-demo");
+    vi.stubEnv("MANUS_API_URL", "");
+    vi.stubEnv("MANUS_API_KEY", "");
+    const networkRequest = vi.fn();
+    vi.stubGlobal("fetch", networkRequest);
+
+    const first = await createLiveDraftForClient("T01", "offline-test-a");
+    const second = await createLiveDraftForClient("T01", "offline-test-b");
+
+    expect(getLiveDraftMode()).toBe("offline-demo");
+    expect(first).toEqual({
+      ok: true,
+      text: "Это демонстрационная сцена с синтетическими данными; реальный эфир не подключён.",
+      model: "offline-demo",
+    });
+    expect(second).toEqual(first);
+    expect(networkRequest).not.toHaveBeenCalled();
+  });
+
   it("passes AbortSignal through to fetch and does not retry a canceled request", async () => {
     vi.stubEnv("MANUS_API_URL", "https://api.example.invalid");
     vi.stubEnv("MANUS_API_KEY", "unit-test-key");
@@ -164,9 +264,9 @@ describe("safe LIVE draft service", () => {
           signal?.addEventListener(
             "abort",
             () => reject(new DOMException("Aborted", "AbortError")),
-            { once: true },
+            { once: true }
           );
-        }),
+        })
     );
     vi.stubGlobal("fetch", request);
 

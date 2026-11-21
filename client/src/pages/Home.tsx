@@ -35,9 +35,10 @@ const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
 const errorCopy: Record<string, string> = {
   UNSUPPORTED_FIXTURE: "Этот тест не разрешён для AI-черновика.",
   RATE_LIMITED: "Пауза между тестовыми запросами ещё не закончилась.",
-  MODEL_TIMEOUT: "AI не ответил вовремя. Безопасное состояние: молчание.",
-  MODEL_UNAVAILABLE: "AI временно недоступен. Черновик не создан.",
-  MODEL_EMPTY: "AI вернул пустой результат. Черновик не создан.",
+  CANCELLED: "Черновик отменён оператором. Текст не создан.",
+  MODEL_TIMEOUT: "Операция завершилась по тайм-ауту. Безопасное состояние: молчание.",
+  MODEL_UNAVAILABLE: "Источник черновика временно недоступен. Текст не создан.",
+  MODEL_EMPTY: "Источник вернул пустой результат. Черновик не создан.",
   DRAFT_REJECTED: "Результат не прошёл проверку. Он не показан и не озвучен.",
   REQUEST_FAILED: "Не удалось выполнить тестовый запрос. Ничего не одобрено.",
 };
@@ -70,6 +71,7 @@ export default function Home() {
   );
   const [logs, setLogs] = useState<TechLog[]>([]);
   const generationEpoch = useRef(0);
+  const activeDraftRequestId = useRef<string | null>(null);
   const playbackEpoch = useRef(0);
   const activePlaybackStartedAt = useRef<number | null>(null);
   const imageObjectUrl = useRef<string | null>(null);
@@ -78,7 +80,14 @@ export default function Home() {
   const selectedFixture =
     LIVE_FIXTURES.find(fixture => fixture.id === selectedFixtureId) ??
     LIVE_FIXTURES[0];
+  const draftModeQuery = trpc.live.mode.useQuery(undefined, {
+    retry: false,
+    refetchOnWindowFocus: false,
+  });
+  const draftMode = draftModeQuery.data;
+  const isOfflineDemo = draftMode === "offline-demo";
   const draftMutation = trpc.live.draft.useMutation();
+  const cancelDraftMutation = trpc.live.cancelDraft.useMutation();
   const requestPending = draftMutation.isPending && !emergencyStopped;
 
   const addLog = (state: string, durationMs = 0, errorCode = "—") => {
@@ -95,6 +104,16 @@ export default function Home() {
     );
   };
 
+  const cancelCurrentDraft = () => {
+    const requestId = activeDraftRequestId.current;
+    if (!requestId) return;
+    activeDraftRequestId.current = null;
+    cancelDraftMutation.mutate(
+      { requestId },
+      { onError: () => addLog("DRAFT_CANCEL_FAILED", 0, "CANCEL_FAILED") },
+    );
+  };
+
   const invalidatePendingDraft = () => {
     generationEpoch.current += 1;
     setDraftText("");
@@ -107,6 +126,7 @@ export default function Home() {
   const handleSelectFixture = (fixtureId: LiveFixtureId) => {
     if (fixtureId === selectedFixtureId) return;
     generationEpoch.current += 1;
+    cancelCurrentDraft();
     setSelectedFixtureId(fixtureId);
     setDraftText("");
     setApprovedText("");
@@ -117,27 +137,45 @@ export default function Home() {
   };
 
   const handleGenerateDraft = () => {
-    if (!selectedFixture.aiEligible || emergencyStopped || requestPending) return;
+    if (
+      !draftMode ||
+      !selectedFixture.aiEligible ||
+      emergencyStopped ||
+      requestPending
+    ) return;
     generationEpoch.current += 1;
     const requestEpoch = generationEpoch.current;
+    const requestId = crypto.randomUUID();
+    activeDraftRequestId.current = requestId;
     const startedAt = performance.now();
     setDraftText("");
     setApprovedText("");
     setSubtitleText("");
     setWasPlayed(false);
-    setDraftState("Запрос отправлен вручную · ожидаю ответ AI provider");
+    setDraftState(
+      isOfflineDemo
+        ? "Запрос отправлен вручную · локальный синтетический ответ"
+        : "Запрос отправлен вручную · ожидаю ответ провайдера",
+    );
     addLog("DRAFT_REQUESTED");
 
     draftMutation.mutate(
-      { fixtureId: selectedFixture.id },
+      { fixtureId: selectedFixture.id, requestId },
       {
         onSuccess: result => {
           const durationMs = performance.now() - startedAt;
+          if (activeDraftRequestId.current === requestId) {
+            activeDraftRequestId.current = null;
+          }
           if (requestEpoch !== generationEpoch.current) return;
           if (emergencyStopped) return;
           if (result.ok) {
             setDraftText(result.text);
-            setDraftState(`Черновик готов · ${result.model} · требуется проверка`);
+            const source =
+              result.model === "offline-demo"
+                ? "offline-demo"
+                : `источник ${result.model}`;
+            setDraftState(`Черновик готов · ${source} · требуется проверка`);
             addLog("DRAFT_READY", durationMs);
           } else {
             setDraftText("");
@@ -147,6 +185,9 @@ export default function Home() {
         },
         onError: () => {
           const durationMs = performance.now() - startedAt;
+          if (activeDraftRequestId.current === requestId) {
+            activeDraftRequestId.current = null;
+          }
           if (requestEpoch !== generationEpoch.current) return;
           setDraftText("");
           setDraftState(errorCopy.REQUEST_FAILED);
@@ -168,6 +209,7 @@ export default function Home() {
 
   const handleCancelDraft = () => {
     generationEpoch.current += 1;
+    cancelCurrentDraft();
     if ("speechSynthesis" in window && window.speechSynthesis.speaking) {
       playbackEpoch.current += 1;
       window.speechSynthesis.cancel();
@@ -207,6 +249,7 @@ export default function Home() {
 
   const handleEmergencyStop = () => {
     generationEpoch.current += 1;
+    cancelCurrentDraft();
     playbackEpoch.current += 1;
     if ("speechSynthesis" in window) window.speechSynthesis.cancel();
     if (subtitleTimer.current) window.clearTimeout(subtitleTimer.current);
@@ -363,8 +406,20 @@ export default function Home() {
         </div>
         <div className="model-note">
           <Sparkles size={15} />
-          <span>AI provider · configured model · low effort</span>
-          <span className="model-note-sub">Каждый ручной запрос расходует кредиты проекта</span>
+          <span>
+            {isOfflineDemo
+              ? "OFFLINE DEMO · фиксированные ответы"
+              : draftMode === "provider"
+                ? "Внешний AI provider"
+                : "Режим не подтверждён"}
+          </span>
+          <span className="model-note-sub">
+            {isOfflineDemo
+              ? "Без сетевого вызова и расхода model credits"
+              : draftMode === "provider"
+                ? "Ручной запрос отправит тестовую фикстуру настроенному провайдеру"
+                : "Создание черновиков заблокировано до проверки режима"}
+          </span>
         </div>
       </section>
 
@@ -416,7 +471,7 @@ export default function Home() {
             <div className="scene-meta-row">
               <div className="meta-card">
                 <span className="meta-icon"><ShieldCheck size={16} /></span>
-                <div><strong>AI-черновик</strong><small>Не имитирует реальных людей</small></div>
+                <div><strong>Черновик ответа</strong><small>Не имитирует реальных людей</small></div>
               </div>
               <div className="meta-card">
                 <span className="meta-icon"><ImagePlus size={16} /></span>
@@ -499,7 +554,7 @@ export default function Home() {
               </div>
               <span className="queue-count">{LIVE_FIXTURES.length} теста</span>
             </div>
-            <p className="microcopy queue-note">Выбор кейса ничего не отправляет модели. AI-допуск есть только у заранее утверждённых T01–T03.</p>
+            <p className="microcopy queue-note">Выбор кейса ничего не отправляет. В offline-demo черновики фиксированы и локальны; доступны только T01–T03.</p>
             <div className="fixture-list">
               {LIVE_FIXTURES.map(fixture => (
                 <button
@@ -509,7 +564,7 @@ export default function Home() {
                   type="button"
                   aria-pressed={selectedFixtureId === fixture.id}
                 >
-                  <span className="fixture-topline"><span className="fixture-id">{fixture.id}</span><span className="fixture-access"><LockKeyhole size={11} /> AI TEST</span></span>
+                  <span className="fixture-topline"><span className="fixture-id">{fixture.id}</span><span className="fixture-access"><LockKeyhole size={11} /> DEMO TEST</span></span>
                   <span className="fixture-comment"><MessageCircle size={14} /> {fixture.comment}</span>
                   <span className="fixture-expectation">Ожидается: {fixture.expectedBehavior}</span>
                   {selectedFixtureId === fixture.id && <span className="fixture-selected"><Check size={12} /> ВЫБРАНО</span>}
@@ -533,7 +588,7 @@ export default function Home() {
             <button
               className="primary-button ai-button"
               type="button"
-              disabled={!selectedFixture.aiEligible || emergencyStopped || draftMutation.isPending}
+              disabled={!draftMode || !selectedFixture.aiEligible || emergencyStopped || draftMutation.isPending}
               onClick={handleGenerateDraft}
             >
               <Sparkles size={16} />
@@ -612,7 +667,7 @@ export default function Home() {
 
       <footer className="bottom-bar">
         <div><span className="footer-mark"><Moon size={14} /></span><span>DEMO / PROTOTYPE 0.1</span></div>
-        <span>AI-черновик ≠ одобрение · голос выключен по умолчанию · тесты не сохраняются</span>
+        <span>Черновик ≠ одобрение · голос выключен по умолчанию · тесты не сохраняются</span>
         <span className="footer-live"><span className="status-dot" /> НЕ В ЭФИРЕ</span>
       </footer>
     </main>
