@@ -1,6 +1,13 @@
 import { invokeLLM, type InvokeParams, type InvokeResult } from "./_core/llm";
 import { getLiveFixture, type LiveFixtureId } from "../shared/liveFixtures";
 
+import {
+  abortable,
+  missingLiveModerationProvider,
+  runLiveModeration,
+  type LiveModerationProvider,
+} from "./liveModeration";
+
 export const LIVE_DRAFT_MODEL =
   process.env.LIVE_DRAFT_MODEL ?? "configured-model";
 export const LIVE_DRAFT_TIMEOUT_MS = 12_000;
@@ -15,7 +22,10 @@ export type LiveDraftErrorCode =
   | "MODEL_TIMEOUT"
   | "MODEL_UNAVAILABLE"
   | "MODEL_EMPTY"
-  | "DRAFT_REJECTED";
+  | "DRAFT_REJECTED"
+  | "INPUT_REJECTED"
+  | "OUTPUT_REJECTED"
+  | "MODERATION_UNAVAILABLE";
 
 export type LiveDraftResult =
   | { ok: true; text: string; model: string }
@@ -25,6 +35,7 @@ type DraftInvoker = (params: InvokeParams) => Promise<InvokeResult>;
 
 type DraftServiceOptions = {
   invoke?: DraftInvoker;
+  moderate?: LiveModerationProvider;
   now?: () => number;
   timeoutMs?: number;
   cooldownMs?: number;
@@ -67,6 +78,7 @@ function validateDraft(content: unknown): string | null {
 
 export function createDraftService(options: DraftServiceOptions = {}) {
   const invoke = options.invoke ?? invokeLLM;
+  const moderate = options.moderate ?? missingLiveModerationProvider;
   const now = options.now ?? Date.now;
   const timeoutMs = options.timeoutMs ?? LIVE_DRAFT_TIMEOUT_MS;
   const cooldownMs = options.cooldownMs ?? LIVE_DRAFT_COOLDOWN_MS;
@@ -128,15 +140,41 @@ export function createDraftService(options: DraftServiceOptions = {}) {
       const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
       try {
-        const response = await invoke({
-          model: LIVE_DRAFT_MODEL,
-          reasoning: { effort: "low" },
+        const inputModeration = await runLiveModeration(moderate, {
+          stage: "input",
+          text: fixture.comment,
           signal: controller.signal,
-          messages: [
-            { role: "system", content: SYSTEM_PROMPT },
-            { role: "user", content: fixture.comment },
-          ],
         });
+        if (controller.signal.aborted) {
+          return {
+            ok: false,
+            code: cancelledByOperator ? "CANCELLED" : "MODEL_TIMEOUT",
+          };
+        }
+        if (inputModeration !== "allowed") {
+          return {
+            ok: false,
+            code:
+              inputModeration === "rejected"
+                ? "INPUT_REJECTED"
+                : "MODERATION_UNAVAILABLE",
+          };
+        }
+
+        const response = await abortable(
+          Promise.resolve().then(() =>
+            invoke({
+              model: LIVE_DRAFT_MODEL,
+              reasoning: { effort: "low" },
+              signal: controller.signal,
+              messages: [
+                { role: "system", content: SYSTEM_PROMPT },
+                { role: "user", content: fixture.comment },
+              ],
+            })
+          ),
+          controller.signal
+        );
 
         const text = validateDraft(response.choices?.[0]?.message?.content);
         if (!text) {
@@ -147,6 +185,27 @@ export function createDraftService(options: DraftServiceOptions = {}) {
               typeof content === "string" && content.trim()
                 ? "DRAFT_REJECTED"
                 : "MODEL_EMPTY",
+          };
+        }
+
+        const outputModeration = await runLiveModeration(moderate, {
+          stage: "output",
+          text,
+          signal: controller.signal,
+        });
+        if (controller.signal.aborted) {
+          return {
+            ok: false,
+            code: cancelledByOperator ? "CANCELLED" : "MODEL_TIMEOUT",
+          };
+        }
+        if (outputModeration !== "allowed") {
+          return {
+            ok: false,
+            code:
+              outputModeration === "rejected"
+                ? "OUTPUT_REJECTED"
+                : "MODERATION_UNAVAILABLE",
           };
         }
 

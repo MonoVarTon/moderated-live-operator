@@ -12,6 +12,7 @@ A local browser prototype for a human-operated live-content scene. Its default W
 - The optional image preview uses an object URL in the current tab. No sample artwork or screenshots are distributed, and the selected file is not uploaded by this feature.
 - Event history is limited to technical state, duration, and error codes in page memory; message and draft text are not written to the event log.
 - Errors, timeouts, and rejected output fail closed; there is no automatic fallback, approval, playback, or repetition.
+- Provider mode requires an independent moderation provider to allow the synthetic input before model invocation and the output before it is returned. No moderation provider is configured, so this path fails closed by default; the gate is an interface, not a verified policy classifier.
 
 ## Local offline demo on Windows
 
@@ -44,7 +45,7 @@ pnpm test
 pnpm build
 ```
 
-Verified locally on Windows on 2026-11-21 with pnpm 10.18.0: TypeScript check passed; all 24 tests across 5 files passed; production build passed. The Vite build emits a non-fatal warning that the classic `/api/platform/config.js` script cannot be bundled as a module; the runtime route is served separately. The final development HTTP smoke returned 200 for health, app page, Vite entry asset, and `/api/platform/config.js`; the runtime config used `Cache-Control: no-store`. The tRPC smoke confirmed `offline-demo`, the fixed T01 response, and that cancellation correctly found no active upstream call in offline mode. A separate smoke against the production bundle returned 200 for health, page, built asset, and runtime config; it confirmed anonymous production draft and cancellation requests are denied, without calling an upstream provider.
+Verified locally on Windows on 2026-11-21 with pnpm 10.18.0: TypeScript check passed; all 29 tests across 5 files passed; production build passed. The Vite build emits a non-fatal warning that the classic `/api/platform/config.js` script cannot be bundled as a module; the runtime route is served separately. The final development HTTP smoke returned 200 for health, app page, Vite entry asset, and `/api/platform/config.js`; the runtime config used `Cache-Control: no-store`. The tRPC smoke confirmed `offline-demo`, the fixed T01 response, and that cancellation correctly found no active upstream call in offline mode. A separate smoke against the production bundle returned 200 for health, page, built asset, and runtime config; it confirmed anonymous production draft and cancellation requests are denied, without calling an upstream provider.
 
 Do not commit `.env` files or credentials. No production deployment instructions are included because the relevant provider and production integrations have not been verified.
 

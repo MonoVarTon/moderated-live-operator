@@ -7,6 +7,7 @@ import {
   getLiveDraftMode,
   LIVE_DRAFT_MODEL,
 } from "./liveDraft";
+import type { LiveModerationRequest } from "./liveModeration";
 import { LIVE_FIXTURES } from "../shared/liveFixtures";
 
 function completion(content: string): InvokeResult {
@@ -24,6 +25,15 @@ function completion(content: string): InvokeResult {
   };
 }
 
+function createTestService(
+  options: NonNullable<Parameters<typeof createDraftService>[0]> = {}
+) {
+  return createDraftService({
+    moderate: async () => "allow" as const,
+    ...options,
+  });
+}
+
 afterEach(() => {
   vi.unstubAllEnvs();
   vi.unstubAllGlobals();
@@ -31,11 +41,12 @@ afterEach(() => {
 });
 
 describe("safe LIVE draft service", () => {
-  it("sends only the selected, pre-approved T01 fixture with the fixed model", async () => {
+  it("checks input and output separately before returning a provider draft", async () => {
     const invoke = vi.fn(async (_params: InvokeParams) =>
       completion("Эта демо-сцена имеет условную метку «Demo».")
     );
-    const service = createDraftService({ invoke });
+    const moderate = vi.fn(async () => "allow" as const);
+    const service = createTestService({ invoke, moderate });
 
     const result = await service.createDraft("T01");
 
@@ -45,6 +56,10 @@ describe("safe LIVE draft service", () => {
       model: LIVE_DRAFT_MODEL,
     });
     expect(invoke).toHaveBeenCalledTimes(1);
+    expect(moderate.mock.calls.map(([request]) => request.stage)).toEqual([
+      "input",
+      "output",
+    ]);
     const request = invoke.mock.calls[0][0];
     expect(request.model).toBe(LIVE_DRAFT_MODEL);
     expect(request.reasoning).toEqual({ effort: "low" });
@@ -58,7 +73,7 @@ describe("safe LIVE draft service", () => {
 
   it("never sends an unsupported or free-form fixture to the model", async () => {
     const invoke = vi.fn(async () => completion("Не должен вызываться."));
-    const service = createDraftService({ invoke });
+    const service = createTestService({ invoke });
 
     const result = await service.createDraft(
       "T08" as (typeof LIVE_FIXTURES)[number]["id"]
@@ -68,9 +83,79 @@ describe("safe LIVE draft service", () => {
     expect(invoke).not.toHaveBeenCalled();
   });
 
+  it("fails closed before model invocation when moderation is not configured", async () => {
+    const invoke = vi.fn(async () => completion("Не должен возвращаться."));
+    const service = createDraftService({ invoke });
+
+    await expect(service.createDraft("T01")).resolves.toEqual({
+      ok: false,
+      code: "MODERATION_UNAVAILABLE",
+    });
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it("rejects review-required input before model invocation", async () => {
+    const invoke = vi.fn(async () => completion("Не должен возвращаться."));
+    const moderate = vi.fn(async () => "review" as const);
+    const service = createTestService({ invoke, moderate });
+
+    await expect(service.createDraft("T01")).resolves.toEqual({
+      ok: false,
+      code: "INPUT_REJECTED",
+    });
+    expect(moderate).toHaveBeenCalledTimes(1);
+    expect(moderate.mock.calls[0][0].stage).toBe("input");
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it("never returns a blocked model answer", async () => {
+    const invoke = vi.fn(async () =>
+      completion("Потенциально рискованный ответ.")
+    );
+    const moderate = vi.fn(async ({ stage }: LiveModerationRequest) =>
+      stage === "output" ? ("block" as const) : ("allow" as const)
+    );
+    const service = createTestService({ invoke, moderate });
+
+    await expect(service.createDraft("T01")).resolves.toEqual({
+      ok: false,
+      code: "OUTPUT_REJECTED",
+    });
+    expect(moderate.mock.calls.map(([request]) => request.stage)).toEqual([
+      "input",
+      "output",
+    ]);
+  });
+
+  it("fails closed and does not call the model when moderation throws", async () => {
+    const invoke = vi.fn(async () => completion("Не должен возвращаться."));
+    const moderate = vi.fn(async () => {
+      throw new Error("private moderation failure");
+    });
+    const service = createTestService({ invoke, moderate });
+
+    const result = await service.createDraft("T01");
+
+    expect(result).toEqual({ ok: false, code: "MODERATION_UNAVAILABLE" });
+    expect(invoke).not.toHaveBeenCalled();
+    expect(JSON.stringify(result)).not.toContain("private moderation failure");
+  });
+
+  it("times out an unresponsive moderation provider and returns no draft", async () => {
+    const invoke = vi.fn(async () => completion("Не должен возвращаться."));
+    const moderate = vi.fn(() => new Promise<"allow">(() => undefined));
+    const service = createTestService({ invoke, moderate, timeoutMs: 10 });
+
+    await expect(service.createDraft("T01")).resolves.toEqual({
+      ok: false,
+      code: "MODEL_TIMEOUT",
+    });
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
   it("fails closed on a missing or empty completion", async () => {
     const invoke = vi.fn(async () => completion("   "));
-    const service = createDraftService({ invoke });
+    const service = createTestService({ invoke });
 
     await expect(service.createDraft("T02")).resolves.toEqual({
       ok: false,
@@ -87,7 +172,7 @@ describe("safe LIVE draft service", () => {
     ];
 
     for (const output of outputs) {
-      const service = createDraftService({
+      const service = createTestService({
         invoke: vi.fn(async () => completion(output)),
       });
       await expect(service.createDraft("T01")).resolves.toEqual({
@@ -101,7 +186,7 @@ describe("safe LIVE draft service", () => {
     const invoke = vi.fn(async () => {
       throw new Error("private prompt text must not be forwarded");
     });
-    const service = createDraftService({ invoke });
+    const service = createTestService({ invoke });
 
     const result = await service.createDraft("T03");
 
@@ -120,7 +205,7 @@ describe("safe LIVE draft service", () => {
           );
         })
     );
-    const service = createDraftService({ invoke, timeoutMs: 10 });
+    const service = createTestService({ invoke, timeoutMs: 10 });
 
     await expect(service.createDraft("T02")).resolves.toEqual({
       ok: false,
@@ -132,7 +217,7 @@ describe("safe LIVE draft service", () => {
   it("limits repeated manual requests in the same server process", async () => {
     let clock = 1_000;
     const invoke = vi.fn(async () => completion("Тестовый ответ."));
-    const service = createDraftService({
+    const service = createTestService({
       invoke,
       now: () => clock,
       cooldownMs: 5_000,
@@ -155,7 +240,7 @@ describe("safe LIVE draft service", () => {
   it("applies cooldown per requester instead of blocking other operators", async () => {
     let clock = 1_000;
     const invoke = vi.fn(async () => completion("Тестовый ответ."));
-    const service = createDraftService({
+    const service = createTestService({
       invoke,
       now: () => clock,
       cooldownMs: 5_000,
@@ -191,9 +276,10 @@ describe("safe LIVE draft service", () => {
           );
         })
     );
-    const service = createDraftService({ invoke, timeoutMs: 60_000 });
+    const service = createTestService({ invoke, timeoutMs: 60_000 });
     const pending = service.createDraft("T01", "operator-a", "request-a");
 
+    await vi.waitFor(() => expect(invoke).toHaveBeenCalledTimes(1));
     expect(service.cancelDraft("operator-b", "request-a")).toBe(false);
     expect(service.cancelDraft("operator-a", "request-a")).toBe(true);
     await expect(pending).resolves.toEqual({ ok: false, code: "CANCELLED" });
@@ -212,7 +298,7 @@ describe("safe LIVE draft service", () => {
           );
         })
     );
-    const service = createDraftService({ invoke, timeoutMs: 60_000 });
+    const service = createTestService({ invoke, timeoutMs: 60_000 });
     const pending = Array.from({ length: 8 }, (_, index) =>
       service.createDraft("T01", `operator-${index}`, `request-${index}`)
     );
@@ -220,6 +306,7 @@ describe("safe LIVE draft service", () => {
     await expect(
       service.createDraft("T01", "operator-overflow", "request-overflow")
     ).resolves.toEqual({ ok: false, code: "RATE_LIMITED" });
+    await vi.waitFor(() => expect(invoke).toHaveBeenCalledTimes(8));
     expect(invoke).toHaveBeenCalledTimes(8);
 
     for (let index = 0; index < 8; index += 1) {
