@@ -22,14 +22,18 @@ A compatible AI provider and model must be configured for the server adapter; a 
 
 The repository uses React, TypeScript, Vite, Express, tRPC, and pnpm.
 
+The project pins `pnpm@10.18.0`. On Windows, use the hoisted linker shown below when standard pnpm linking is blocked by symlink permissions; the lockfile remains frozen.
+
 ```bash
-pnpm install --frozen-lockfile
+pnpm install --frozen-lockfile --node-linker=hoisted
 pnpm check
 pnpm test
 pnpm build
 ```
 
-The default runtime expects the platform adapter and environment variables described in `server/_core/env.ts`. Do not commit `.env` files or credentials. For standalone deployment, replace the adapter and configure provider authentication in the target environment's secret store.
+Verified locally on Windows with pnpm 10.18.0 on 2026-11-21: the type check, all 14 tests across 3 files, and the production build passed. `pnpm ignored-builds` reported no ignored builds. Vite emitted a non-fatal warning that `/api/platform/config.js` cannot be bundled without `type="module"`; this platform boundary still requires review before any production work.
+
+The default runtime expects the platform adapter and environment variables described in `server/_core/env.ts`. Do not commit `.env` files or credentials. Standalone deployment, provider authentication, and live integration setup are not verified; this README does not provide production deployment instructions.
 
 ## Scope
 
